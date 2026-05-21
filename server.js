@@ -8,7 +8,6 @@ import {
   CallToolRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 
-const PORT = process.env.PORT || 3000;
 
 const server = new Server(
   {
@@ -70,7 +69,7 @@ app.get("/", (req, res) => {
   res.send("MCP Server rodando");
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
 });
