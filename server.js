@@ -58,12 +58,28 @@ app.use(express.json());
 app.post("/mcp", async (req, res) => {
   try {
     const response = await server.handleRequest(req.body);
-    res.json(response);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Erro no MCP");
+    
+    if (response) {
+      res.json(response);
+    } else {
+      res.status(204).send();
+    }
+
+  } catch (error) {
+    console.error("Erro MCP:", error);
+
+    res.status(500).json({
+      jsonrpc: "2.0",
+      id: req.body?.id || null,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: error.message
+      }
+    });
   }
 });
+
 
 app.get("/", (req, res) => {
   res.send("MCP Server rodando");
