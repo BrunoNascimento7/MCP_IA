@@ -13,6 +13,12 @@ import express from "express";
  * - DESK_API_HOST (default: https://api.desk.ms)
  * - MCP_BEARER_TOKEN (protege o endpoint /mcp)
  * - ALLOWED_ORIGINS (lista separada por vírgula)
+ *
+ * Base / FAQ:
+ * - FAQ_SOURCE_MODE = remote_json | inline_json
+ * - FAQ_JSON_URL
+ * - FAQ_DATA_JSON
+ * - KB_REFRESH_MS
  */
 
 const PORT = Number(process.env.PORT || 3000);
@@ -21,7 +27,6 @@ const OP_KEY = process.env.OP_KEY || "";
 const ENV_KEY = process.env.ENV_KEY || "";
 const COD_SOLICITANTE = Number(process.env.COD_SOLICITANTE || 289);
 
-// Pode vir como "api.desk.ms" ou "https://api.desk.ms"
 const RAW_DESK_API_HOST = process.env.DESK_API_HOST || "https://api.desk.ms";
 const DESK_API_BASE = normalizeBaseUrl(RAW_DESK_API_HOST);
 
@@ -31,10 +36,22 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// ===== FAQ / Base =====
+const FAQ_SOURCE_MODE = process.env.FAQ_SOURCE_MODE || "remote_json"; // remote_json | inline_json
+const FAQ_JSON_URL = process.env.FAQ_JSON_URL || "";
+const FAQ_DATA_JSON = process.env.FAQ_DATA_JSON || "";
+const KB_REFRESH_MS = Number(process.env.KB_REFRESH_MS || 300000); // 5 min
+
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 let cachedToken = null;
+
+// cache da base
+let knowledgeCache = {
+  loadedAt: 0,
+  items: [],
+};
 
 /**
  * =========================================================
@@ -43,12 +60,9 @@ let cachedToken = null;
  */
 function normalizeBaseUrl(value) {
   if (!value) return "https://api.desk.ms";
-
-  // Se vier só o host, adiciona https://
   if (!/^https?:\/\//i.test(value)) {
     return `https://${value}`;
   }
-
   return value;
 }
 
@@ -128,13 +142,85 @@ async function httpJson(url, options = {}) {
   };
 }
 
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeText(value = "") {
+  return String(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function tokenize(value = "") {
+  return normalizeText(value)
+    .split(/[^a-z0-9]+/i)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function unique(arr = []) {
+  return [...new Set(arr)];
+}
+
+function buildSearchBlob(item) {
+  return normalizeText(
+    [
+      item.id,
+      item.titulo,
+      item.resumo,
+      item.conteudo,
+      item.tipo,
+      ...(Array.isArray(item.palavras_chave) ? item.palavras_chave : []),
+      item.url,
+      item.fonte,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+}
+
+function scoreItem(item, query) {
+  const terms = unique(tokenize(query));
+  if (!terms.length) return 0;
+
+  const titulo = normalizeText(item.titulo || "");
+  const resumo = normalizeText(item.resumo || "");
+  const conteudo = normalizeText(item.conteudo || "");
+  const palavras = normalizeText(
+    Array.isArray(item.palavras_chave) ? item.palavras_chave.join(" ") : ""
+  );
+  const tipo = normalizeText(item.tipo || "");
+  const blob = buildSearchBlob(item);
+
+  let score = 0;
+
+  for (const term of terms) {
+    if (titulo.includes(term)) score += 8;
+    if (resumo.includes(term)) score += 5;
+    if (palavras.includes(term)) score += 6;
+    if (conteudo.includes(term)) score += 2;
+    if (blob.includes(term)) score += 1;
+  }
+
+  // bônus por tipo FAQ
+  if (tipo.includes("faq")) score += 2;
+
+  return score;
+}
+
 /**
  * =========================================================
  * SEGURANÇA DO MCP REMOTO
  * =========================================================
  */
 function authMiddleware(req, res, next) {
-  // Se não definiu token, deixa aberto
   if (!MCP_BEARER_TOKEN) return next();
 
   const auth = req.headers.authorization || "";
@@ -151,12 +237,9 @@ function authMiddleware(req, res, next) {
 }
 
 function originMiddleware(req, res, next) {
-  // Se não configurou origens, não bloqueia
   if (!ALLOWED_ORIGINS.length) return next();
 
   const origin = req.headers.origin;
-
-  // Só valida quando Origin vier informado
   if (origin && !ALLOWED_ORIGINS.includes(origin)) {
     return res.status(403).json({
       error: "Forbidden",
@@ -220,7 +303,6 @@ async function deskAPI(method, path, body = null) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // Retry simples se o token tiver expirado
   if (response.status === 401 || response.status === 403) {
     cachedToken = null;
     const retryToken = await getDeskToken();
@@ -239,12 +321,134 @@ async function deskAPI(method, path, body = null) {
 
 /**
  * =========================================================
+ * BASE / FAQ
+ * =========================================================
+ * Formato esperado do catálogo:
+ * [
+ *   {
+ *     "id": "faq-001",
+ *     "titulo": "Troca de senha",
+ *     "resumo": "Passo a passo para redefinir senha.",
+ *     "conteudo": "1. Acesse ... 2. Clique ...",
+ *     "tipo": "FAQ",
+ *     "palavras_chave": ["senha", "acesso", "login"],
+ *     "url": "https://...",
+ *     "fonte": "Desk Manager",
+ *     "ativo": true
+ *   }
+ * ]
+ */
+
+async function loadKnowledgeBase() {
+  const now = Date.now();
+
+  if (
+    knowledgeCache.items.length &&
+    now - knowledgeCache.loadedAt < KB_REFRESH_MS
+  ) {
+    return knowledgeCache.items;
+  }
+
+  let items = [];
+
+  if (FAQ_SOURCE_MODE === "inline_json") {
+    if (!FAQ_DATA_JSON) {
+      knowledgeCache = { loadedAt: now, items: [] };
+      return [];
+    }
+
+    items = safeJsonParse(FAQ_DATA_JSON, []);
+  } else if (FAQ_SOURCE_MODE === "remote_json") {
+    if (!FAQ_JSON_URL) {
+      knowledgeCache = { loadedAt: now, items: [] };
+      return [];
+    }
+
+    const response = await httpJson(FAQ_JSON_URL, { method: "GET" });
+
+    if (!response.ok) {
+      throw new Error(
+        `Erro ao carregar FAQ/base (HTTP ${response.status}): ${response.text}`
+      );
+    }
+
+    items = Array.isArray(response.json) ? response.json : [];
+  } else {
+    items = [];
+  }
+
+  items = items
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      id: String(item.id || ""),
+      titulo: String(item.titulo || ""),
+      resumo: String(item.resumo || ""),
+      conteudo: String(item.conteudo || ""),
+      tipo: String(item.tipo || "Artigo"),
+      palavras_chave: Array.isArray(item.palavras_chave)
+        ? item.palavras_chave.map((p) => String(p))
+        : [],
+      url: item.url ? String(item.url) : "",
+      fonte: item.fonte ? String(item.fonte) : "Base de Conhecimento",
+      ativo: item.ativo !== false,
+    }))
+    .filter((item) => item.id && item.titulo && item.ativo);
+
+  knowledgeCache = {
+    loadedAt: now,
+    items,
+  };
+
+  return items;
+}
+
+async function searchKnowledge(query, options = {}) {
+  const {
+    limit = 5,
+    onlyFaq = false,
+    onlyArticles = false,
+  } = options;
+
+  const base = await loadKnowledgeBase();
+  const normalizedQuery = String(query || "").trim();
+
+  if (!normalizedQuery) return [];
+
+  let filtered = base;
+
+  if (onlyFaq) {
+    filtered = filtered.filter((item) =>
+      normalizeText(item.tipo).includes("faq")
+    );
+  }
+
+  if (onlyArticles) {
+    filtered = filtered.filter(
+      (item) => !normalizeText(item.tipo).includes("faq")
+    );
+  }
+
+  const scored = filtered
+    .map((item) => ({
+      ...item,
+      score: scoreItem(item, normalizedQuery),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Number(limit || 5));
+
+  return scored;
+}
+
+async function getKnowledgeById(id) {
+  const base = await loadKnowledgeBase();
+  return base.find((item) => item.id === id) || null;
+}
+
+/**
+ * =========================================================
  * TOOLS
  * =========================================================
- * Mantidas conforme a lógica já existente no seu script local:
- * - criar_chamado
- * - listar_chamados
- * - buscar_chamado
  */
 const TOOLS = [
   {
@@ -281,7 +485,8 @@ const TOOLS = [
         },
         data_criacao: {
           type: "string",
-          description: "Filtrar por data de criação no formato YYYY-MM-DD (opcional)",
+          description:
+            "Filtrar por data de criação no formato YYYY-MM-DD (opcional)",
         },
         ativo: {
           type: "string",
@@ -305,6 +510,61 @@ const TOOLS = [
       required: ["id"],
     },
   },
+
+  // ===== FAQ / Base =====
+  {
+    name: "buscar_faq",
+    description:
+      "Busca perguntas frequentes e respostas relacionadas ao problema informado pelo usuário.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consulta: {
+          type: "string",
+          description: "Texto resumido do problema ou palavras-chave.",
+        },
+        limite: {
+          type: "number",
+          description: "Quantidade máxima de resultados.",
+        },
+      },
+      required: ["consulta"],
+    },
+  },
+  {
+    name: "buscar_artigos_base",
+    description:
+      "Busca artigos, procedimentos e processos da Base de Conhecimento relacionados ao problema informado.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consulta: {
+          type: "string",
+          description: "Texto do problema ou palavras-chave.",
+        },
+        limite: {
+          type: "number",
+          description: "Quantidade máxima de resultados.",
+        },
+      },
+      required: ["consulta"],
+    },
+  },
+  {
+    name: "obter_artigo_base",
+    description:
+      "Obtém o conteúdo completo de um artigo ou FAQ da Base de Conhecimento pelo ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Identificador único do artigo ou FAQ.",
+        },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 /**
@@ -313,6 +573,9 @@ const TOOLS = [
  * =========================================================
  */
 async function runTool(toolName, args = {}) {
+  // =========================
+  // CHAMADOS
+  // =========================
   if (toolName === "criar_chamado") {
     if (!args.titulo || typeof args.titulo !== "string") {
       return toolText("Erro: o campo 'titulo' é obrigatório.", true);
@@ -396,6 +659,52 @@ async function runTool(toolName, args = {}) {
     return toolText(`Erro HTTP ${response.status}:\n${response.text}`, true);
   }
 
+  // =========================
+  // FAQ / BASE
+  // =========================
+  if (toolName === "buscar_faq") {
+    if (!args.consulta || typeof args.consulta !== "string") {
+      return toolText("Erro: o campo 'consulta' é obrigatório.", true);
+    }
+
+    const resultados = await searchKnowledge(args.consulta, {
+      limit: Number(args.limite || 5),
+      onlyFaq: true,
+    });
+
+    return toolText(JSON.stringify({ resultados }, null, 2));
+  }
+
+  if (toolName === "buscar_artigos_base") {
+    if (!args.consulta || typeof args.consulta !== "string") {
+      return toolText("Erro: o campo 'consulta' é obrigatório.", true);
+    }
+
+    const resultados = await searchKnowledge(args.consulta, {
+      limit: Number(args.limite || 5),
+      onlyArticles: true,
+    });
+
+    return toolText(JSON.stringify({ resultados }, null, 2));
+  }
+
+  if (toolName === "obter_artigo_base") {
+    if (!args.id || typeof args.id !== "string") {
+      return toolText("Erro: o campo 'id' é obrigatório.", true);
+    }
+
+    const artigo = await getKnowledgeById(args.id);
+
+    if (!artigo) {
+      return toolText(
+        `Nenhum artigo/FAQ encontrado para o id '${args.id}'.`,
+        true
+      );
+    }
+
+    return toolText(JSON.stringify(artigo, null, 2));
+  }
+
   return toolText(`Ferramenta desconhecida: ${toolName}`, true);
 }
 
@@ -420,13 +729,11 @@ app.get("/health", (req, res) => {
  * =========================================================
  * MCP ENDPOINT
  * =========================================================
- * GET /mcp
- * Só retorna metadados simples do endpoint
  */
 app.get("/mcp", authMiddleware, originMiddleware, (req, res) => {
   res.json({
     name: "desk-manager-remote-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
     endpoint: "/mcp",
     transport: "streamable-http",
     methods: [
@@ -438,10 +745,6 @@ app.get("/mcp", authMiddleware, originMiddleware, (req, res) => {
   });
 });
 
-/**
- * POST /mcp
- * Endpoint MCP remoto em JSON-RPC 2.0
- */
 app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
   const msg = req.body;
   const id = msg?.id ?? null;
@@ -492,7 +795,7 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
           },
           serverInfo: {
             name: "desk-manager-remote-mcp",
-            version: "1.0.0",
+            version: "1.1.0",
           },
         })
       );
