@@ -61,6 +61,28 @@ const FAQ_JSON_URL = process.env.FAQ_JSON_URL || "";
 const FAQ_DATA_JSON = process.env.FAQ_DATA_JSON || "";
 const KB_REFRESH_MS = Number(process.env.KB_REFRESH_MS || 300000); // 5 min
 
+// --- Anthropic (rota /chat — proxy do widget → Claude) ---
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 1024);
+const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_MCP_BETA = "mcp-client-2025-04-04";
+const CHAT_TIMEOUT_MS = Number(process.env.CHAT_TIMEOUT_MS || 120000); // tool-calls demoram mais
+
+// URL pública DESTE serviço — a Anthropic chama o /mcp de volta (server-to-server).
+const PUBLIC_MCP_URL =
+  process.env.PUBLIC_MCP_URL || "https://mcp-ia.onrender.com/mcp";
+
+// System prompt da SIA (sobrescrevível por env).
+const SIA_SYSTEM_PROMPT =
+  process.env.SIA_SYSTEM_PROMPT ||
+  "Você é a SIA (Suporte de Inteligência Artificial), assistente do Desk " +
+    "Manager. Ajude usuários com chamados, dúvidas e informações. Use as " +
+    "ferramentas MCP disponíveis para consultar a base de conhecimento, FAQs, " +
+    "chamados, operadores e históricos, ou para criar/avaliar chamados, sempre " +
+    "que necessário. Responda em português, de forma clara, curta e amigável. " +
+    "Quando se apresentar ou for citada, use o nome SIA.";
+
 // --- Protocolo MCP ---
 const PROTOCOL_VERSION = "2025-03-26";
 const SERVER_INFO = { name: "desk-manager-remote-mcp", version: "2.0.0" };
@@ -326,6 +348,27 @@ function originMiddleware(req, res, next) {
       message: `Origin não permitida: ${origin}`,
     });
   }
+  next();
+}
+
+// CORS específico da rota /chat (chamada pelo browser/widget).
+// Reaproveita ALLOWED_ORIGINS; vazio = libera qualquer origin ("*").
+function chatCors(req, res, next) {
+  const origin = req.headers.origin;
+  const allowed = !ALLOWED_ORIGINS.length
+    ? "*"
+    : origin && ALLOWED_ORIGINS.includes(origin)
+    ? origin
+    : null;
+
+  if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", allowed);
+    if (allowed !== "*") res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 }
 
@@ -1252,6 +1295,75 @@ app.get("/health", (req, res) => {
     transport: "streamable-http",
     tools: TOOLS.map((t) => t.name),
   });
+});
+
+/**
+ * =========================================================
+ * /chat — PROXY DO WIDGET → CLAUDE (Anthropic API)
+ * =========================================================
+ * O browser NÃO pode segurar a API key da Anthropic. Esta rota:
+ *   1. recebe { messages } do widget;
+ *   2. injeta a x-api-key (env) + system prompt da SIA;
+ *   3. configura mcp_servers apontando para o /mcp DESTE serviço.
+ * A Anthropic chama o /mcp de volta sozinha (server-to-server).
+ */
+app.options("/chat", chatCors);
+app.post("/chat", chatCors, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) {
+      return res
+        .status(500)
+        .json({ error: "ANTHROPIC_API_KEY não configurada no servidor." });
+    }
+
+    const { messages } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages é obrigatório." });
+    }
+
+    // MCP apontando para o próprio serviço; envia o Bearer se houver.
+    const mcpServer = {
+      type: "url",
+      url: PUBLIC_MCP_URL,
+      name: "desk-manager",
+    };
+    if (MCP_BEARER_TOKEN) {
+      mcpServer.authorization_token = MCP_BEARER_TOKEN;
+    }
+
+    const upstream = await requestRaw(
+      "POST",
+      "https://api.anthropic.com/v1/messages",
+      {
+        headers: {
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "anthropic-beta": ANTHROPIC_MCP_BETA,
+        },
+        body: {
+          model: ANTHROPIC_MODEL,
+          max_tokens: ANTHROPIC_MAX_TOKENS,
+          system: SIA_SYSTEM_PROMPT,
+          messages,
+          mcp_servers: [mcpServer],
+        },
+        timeoutMs: CHAT_TIMEOUT_MS,
+      }
+    );
+
+    if (!upstream.ok) {
+      console.error("[CHAT] Anthropic erro:", upstream.status, upstream.text);
+      return res.status(upstream.status).json({
+        error: "Erro na Anthropic API",
+        detail: upstream.json || upstream.text,
+      });
+    }
+
+    return res.json(upstream.json ?? safeJsonParse(upstream.text, {}));
+  } catch (err) {
+    console.error("[CHAT][ERROR]", err);
+    return res.status(500).json({ error: "Erro interno no proxy /chat." });
+  }
 });
 
 /**
