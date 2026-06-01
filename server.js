@@ -1,53 +1,76 @@
+// =====================================================================
+// server.js — Desk Manager Remote MCP (versão unificada)
+// ---------------------------------------------------------------------
+// Junta o melhor dos dois mundos:
+//   • Transporte HTTP remoto (streamable-http) + segurança + base de
+//     conhecimento/FAQ  → do servidor remoto atual
+//   • Ferramentas completas (operadores, históricos, avaliação técnica),
+//     paginação server-side, filtros locais e timeout de rede → do MCP
+//     stdio antigo
+//
+// IMPORTANTE: nenhuma credencial fica no código. Tudo vem de variáveis
+// de ambiente. As chaves que estavam hardcoded no MCP antigo devem ser
+// CONSIDERADAS COMPROMETIDAS e rotacionadas no Desk Manager.
+// =====================================================================
+
 import express from "express";
+import http from "node:http";
+import https from "node:https";
+import { URL } from "node:url";
 
 /**
  * =========================================================
- * ENV
+ * CONFIGURAÇÃO (variáveis de ambiente)
  * =========================================================
- * Obrigatórias:
- * - OP_KEY
- * - ENV_KEY
- * - COD_SOLICITANTE
- *
- * Opcionais:
- * - DESK_API_HOST (default: https://api.desk.ms)
- * - MCP_BEARER_TOKEN (protege o endpoint /mcp)
- * - ALLOWED_ORIGINS (lista separada por vírgula)
- *
- * Base / FAQ:
- * - FAQ_SOURCE_MODE = remote_json | inline_json
- * - FAQ_JSON_URL
- * - FAQ_DATA_JSON
- * - KB_REFRESH_MS
  */
-
 const PORT = Number(process.env.PORT || 3000);
 
+// --- Credenciais Desk Manager (OBRIGATÓRIAS) ---
 const OP_KEY = process.env.OP_KEY || "";
 const ENV_KEY = process.env.ENV_KEY || "";
 const COD_SOLICITANTE = Number(process.env.COD_SOLICITANTE || 289);
 
+// --- Hosts da API ---
 const RAW_DESK_API_HOST = process.env.DESK_API_HOST || "https://api.desk.ms";
 const DESK_API_BASE = normalizeBaseUrl(RAW_DESK_API_HOST);
 
+// Host do formulário web usado para lançar Avaliação Técnica
+const RAW_DESK_WEB_HOST = process.env.DESK_WEB_HOST || "https://vocedm.desk.ms";
+const DESK_WEB_BASE = normalizeBaseUrl(RAW_DESK_WEB_HOST);
+
+// --- Rede ---
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000); // 30s
+// O Desk Manager historicamente exige rejectUnauthorized:false (cadeia de
+// certificado incompleta). Mantemos esse comportamento por padrão, mas é
+// configurável: defina DESK_TLS_INSECURE=false quando o cert estiver ok.
+const DESK_TLS_INSECURE =
+  String(process.env.DESK_TLS_INSECURE ?? "true").toLowerCase() !== "false";
+const FAQ_TLS_INSECURE =
+  String(process.env.FAQ_TLS_INSECURE ?? "false").toLowerCase() === "true";
+
+// --- Segurança do MCP remoto ---
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN || "";
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ===== FAQ / Base =====
+// --- FAQ / Base de Conhecimento ---
 const FAQ_SOURCE_MODE = process.env.FAQ_SOURCE_MODE || "remote_json"; // remote_json | inline_json
 const FAQ_JSON_URL = process.env.FAQ_JSON_URL || "";
 const FAQ_DATA_JSON = process.env.FAQ_DATA_JSON || "";
 const KB_REFRESH_MS = Number(process.env.KB_REFRESH_MS || 300000); // 5 min
+
+// --- Protocolo MCP ---
+const PROTOCOL_VERSION = "2025-03-26";
+const SERVER_INFO = { name: "desk-manager-remote-mcp", version: "2.0.0" };
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 let cachedToken = null;
 
-// cache da base
+// cache da base de conhecimento
 let knowledgeCache = {
   loadedAt: 0,
   items: [],
@@ -55,7 +78,7 @@ let knowledgeCache = {
 
 /**
  * =========================================================
- * HELPERS
+ * HELPERS GERAIS
  * =========================================================
  */
 function normalizeBaseUrl(value) {
@@ -68,7 +91,6 @@ function normalizeBaseUrl(value) {
 
 function ensureEnv() {
   const missing = [];
-
   if (!OP_KEY) missing.push("OP_KEY");
   if (!ENV_KEY) missing.push("ENV_KEY");
   if (!Number.isFinite(COD_SOLICITANTE)) missing.push("COD_SOLICITANTE");
@@ -86,11 +108,7 @@ function log(...args) {
 }
 
 function jsonRpcSuccess(id, result) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    result,
-  };
+  return { jsonrpc: "2.0", id, result };
 }
 
 function jsonRpcError(id, code, message, data = undefined) {
@@ -116,30 +134,8 @@ function buildUrl(path) {
   return new URL(path, DESK_API_BASE).toString();
 }
 
-async function httpJson(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
-
-  const text = await response.text();
-
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
-  }
-
-  return {
-    ok: response.ok,
-    status: response.status,
-    text,
-    json,
-  };
+function buildWebUrl(path) {
+  return new URL(path, DESK_WEB_BASE).toString();
 }
 
 function safeJsonParse(value, fallback = null) {
@@ -150,6 +146,95 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+function formEncode(params) {
+  return Object.entries(params)
+    .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
+    .join("&");
+}
+
+/**
+ * Cliente HTTP unificado (nativo http/https) com timeout, controle de TLS
+ * e suporte a body JSON ou form-urlencoded.
+ * Retorna { ok, status, text, json }.
+ */
+function requestRaw(
+  method,
+  urlStr,
+  { headers = {}, body = null, form = null, timeoutMs = REQUEST_TIMEOUT_MS, insecure = false } = {}
+) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try {
+      url = new URL(urlStr);
+    } catch {
+      return reject(new Error(`URL inválida: ${urlStr}`));
+    }
+
+    const isHttps = url.protocol === "https:";
+    const lib = isHttps ? https : http;
+
+    const finalHeaders = { ...headers };
+    let payload = null;
+
+    if (form) {
+      payload = formEncode(form);
+      finalHeaders["Content-Type"] = "application/x-www-form-urlencoded";
+    } else if (body !== null && body !== undefined) {
+      payload = typeof body === "string" ? body : JSON.stringify(body);
+      if (!finalHeaders["Content-Type"]) {
+        finalHeaders["Content-Type"] = "application/json";
+      }
+    }
+
+    if (payload != null) {
+      finalHeaders["Content-Length"] = Buffer.byteLength(payload);
+    }
+
+    const options = {
+      method,
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      headers: finalHeaders,
+    };
+    if (isHttps && insecure) options.rejectUnauthorized = false;
+
+    const req = lib.request(options, (res) => {
+      let buf = "";
+      res.on("data", (chunk) => (buf += chunk));
+      res.on("end", () => {
+        let json = null;
+        try {
+          json = buf ? JSON.parse(buf) : null;
+        } catch {
+          json = null;
+        }
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          text: buf,
+          json,
+        });
+      });
+    });
+
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(
+        new Error(`Timeout ${timeoutMs}ms em ${method} ${urlStr}`)
+      );
+    });
+
+    if (payload != null) req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * =========================================================
+ * HELPERS DE BUSCA (FAQ / Base)
+ * =========================================================
+ */
 function normalizeText(value = "") {
   return String(value)
     .normalize("NFD")
@@ -200,7 +285,6 @@ function scoreItem(item, query) {
   const blob = buildSearchBlob(item);
 
   let score = 0;
-
   for (const term of terms) {
     if (titulo.includes(term)) score += 8;
     if (resumo.includes(term)) score += 5;
@@ -208,10 +292,7 @@ function scoreItem(item, query) {
     if (conteudo.includes(term)) score += 2;
     if (blob.includes(term)) score += 1;
   }
-
-  // bônus por tipo FAQ
   if (tipo.includes("faq")) score += 2;
-
   return score;
 }
 
@@ -232,7 +313,6 @@ function authMiddleware(req, res, next) {
       message: "Bearer token inválido ou ausente.",
     });
   }
-
   next();
 }
 
@@ -246,77 +326,97 @@ function originMiddleware(req, res, next) {
       message: `Origin não permitida: ${origin}`,
     });
   }
-
   next();
 }
 
 /**
  * =========================================================
- * DESK MANAGER AUTH / API
+ * DESK MANAGER — AUTH / API
  * =========================================================
  */
 async function getDeskToken() {
   ensureEnv();
+  if (cachedToken) return cachedToken;
 
-  if (cachedToken) {
-    return cachedToken;
-  }
-
-  const response = await httpJson(buildUrl("/Login/autenticar"), {
-    method: "POST",
-    headers: {
-      Authorization: OP_KEY,
-    },
-    body: JSON.stringify({
-      PublicKey: ENV_KEY,
-    }),
+  const res = await requestRaw("POST", buildUrl("/Login/autenticar"), {
+    headers: { Authorization: OP_KEY },
+    body: { PublicKey: ENV_KEY },
+    insecure: DESK_TLS_INSECURE,
   });
 
-  if (!response.ok) {
+  if (!res.ok) {
     throw new Error(
-      `Erro ao autenticar no Desk Manager (HTTP ${response.status}): ${response.text}`
+      `Erro ao autenticar no Desk Manager (HTTP ${res.status}): ${res.text}`
     );
   }
 
-  const dados = response.json || {};
-  const token =
-    dados.token ||
-    dados.access_token ||
-    (typeof dados === "string" ? dados : null);
+  const parsed = res.json;
+  let token = null;
 
-  if (!token || dados.erro) {
-    throw new Error(`Falha ao obter token: ${response.text}`);
+  if (parsed && typeof parsed === "object") {
+    if (parsed.erro) {
+      throw new Error(`Falha ao obter token: ${res.text}`);
+    }
+    token = parsed.token || parsed.access_token || null;
+  } else if (typeof parsed === "string") {
+    token = parsed;
+  } else {
+    // token devolvido como string crua (sem aspas JSON)
+    token = res.text ? res.text.trim().replace(/^"|"$/g, "") : null;
+  }
+
+  if (!token) {
+    throw new Error(`Falha ao obter token: ${res.text}`);
   }
 
   cachedToken = typeof token === "string" ? token : JSON.stringify(token);
   return cachedToken;
 }
 
+// Chamadas JSON à API principal (api.desk.ms), com retry de token.
 async function deskAPI(method, path, body = null) {
   const token = await getDeskToken();
 
-  let response = await httpJson(buildUrl(path), {
-    method,
-    headers: {
-      Authorization: token,
-    },
-    body: body ? JSON.stringify(body) : undefined,
+  let res = await requestRaw(method, buildUrl(path), {
+    headers: { Authorization: token },
+    body,
+    insecure: DESK_TLS_INSECURE,
   });
 
-  if (response.status === 401 || response.status === 403) {
+  if (res.status === 401 || res.status === 403) {
     cachedToken = null;
     const retryToken = await getDeskToken();
-
-    response = await httpJson(buildUrl(path), {
-      method,
-      headers: {
-        Authorization: retryToken,
-      },
-      body: body ? JSON.stringify(body) : undefined,
+    res = await requestRaw(method, buildUrl(path), {
+      headers: { Authorization: retryToken },
+      body,
+      insecure: DESK_TLS_INSECURE,
     });
   }
 
-  return response;
+  return res;
+}
+
+// Chamadas form-urlencoded ao host web (vocedm.desk.ms) — Avaliação Técnica.
+async function deskWebForm(method, path, formData) {
+  const token = await getDeskToken();
+
+  let res = await requestRaw(method, buildWebUrl(path), {
+    headers: { Authorization: token },
+    form: formData,
+    insecure: DESK_TLS_INSECURE,
+  });
+
+  if (res.status === 401 || res.status === 403) {
+    cachedToken = null;
+    const retryToken = await getDeskToken();
+    res = await requestRaw(method, buildWebUrl(path), {
+      headers: { Authorization: retryToken },
+      form: formData,
+      insecure: DESK_TLS_INSECURE,
+    });
+  }
+
+  return res;
 }
 
 /**
@@ -338,7 +438,6 @@ async function deskAPI(method, path, body = null) {
  *   }
  * ]
  */
-
 async function loadKnowledgeBase() {
   const now = Date.now();
 
@@ -356,28 +455,26 @@ async function loadKnowledgeBase() {
       knowledgeCache = { loadedAt: now, items: [] };
       return [];
     }
-
     items = safeJsonParse(FAQ_DATA_JSON, []);
   } else if (FAQ_SOURCE_MODE === "remote_json") {
     if (!FAQ_JSON_URL) {
       knowledgeCache = { loadedAt: now, items: [] };
       return [];
     }
-
-    const response = await httpJson(FAQ_JSON_URL, { method: "GET" });
-
-    if (!response.ok) {
+    const res = await requestRaw("GET", FAQ_JSON_URL, {
+      insecure: FAQ_TLS_INSECURE,
+    });
+    if (!res.ok) {
       throw new Error(
-        `Erro ao carregar FAQ/base (HTTP ${response.status}): ${response.text}`
+        `Erro ao carregar FAQ/base (HTTP ${res.status}): ${res.text}`
       );
     }
-
-    items = Array.isArray(response.json) ? response.json : [];
+    items = Array.isArray(res.json) ? res.json : [];
   } else {
     items = [];
   }
 
-  items = items
+  items = (Array.isArray(items) ? items : [])
     .filter((item) => item && typeof item === "object")
     .map((item) => ({
       id: String(item.id || ""),
@@ -394,50 +491,34 @@ async function loadKnowledgeBase() {
     }))
     .filter((item) => item.id && item.titulo && item.ativo);
 
-  knowledgeCache = {
-    loadedAt: now,
-    items,
-  };
-
+  knowledgeCache = { loadedAt: now, items };
   return items;
 }
 
 async function searchKnowledge(query, options = {}) {
-  const {
-    limit = 5,
-    onlyFaq = false,
-    onlyArticles = false,
-  } = options;
+  const { limit = 5, onlyFaq = false, onlyArticles = false } = options;
 
   const base = await loadKnowledgeBase();
   const normalizedQuery = String(query || "").trim();
-
   if (!normalizedQuery) return [];
 
   let filtered = base;
-
   if (onlyFaq) {
     filtered = filtered.filter((item) =>
       normalizeText(item.tipo).includes("faq")
     );
   }
-
   if (onlyArticles) {
     filtered = filtered.filter(
       (item) => !normalizeText(item.tipo).includes("faq")
     );
   }
 
-  const scored = filtered
-    .map((item) => ({
-      ...item,
-      score: scoreItem(item, normalizedQuery),
-    }))
+  return filtered
+    .map((item) => ({ ...item, score: scoreItem(item, normalizedQuery) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, Number(limit || 5));
-
-  return scored;
 }
 
 async function getKnowledgeById(id) {
@@ -447,24 +528,199 @@ async function getKnowledgeById(id) {
 
 /**
  * =========================================================
- * TOOLS
+ * ORQUESTRAÇÃO — AVALIAÇÃO TÉCNICA (alto nível)
+ * =========================================================
+ * Resolve nome do operador → Chave, CodChamado → Chave, encontra a
+ * interação mais recente do operador e lança a avaliação técnica.
+ */
+async function orchestrateAvaliacao(args) {
+  // ---- 1) Resolver nome do operador → Chave ----
+  const rOp = await deskAPI("POST", "/Operadores/lista", {
+    Colunas: {
+      Chave: "on",
+      Nome: "on",
+      Sobrenome: "on",
+      Email: "on",
+      OnOff: "on",
+      GrupoPrincipal: "on",
+      EmailGrupo: "on",
+      CodGrupo: "on",
+    },
+    Pesquisa: args.nome_operador,
+    Ativo: "S",
+    Filtro: {
+      Ramal: [""],
+      GrupoPrincipal: [""],
+      Perfil: [""],
+      Online: [""],
+      LicencaDMS: [""],
+      LicencaCHAT: [""],
+      LicencaRCS: [""],
+      LicencaFornecedor: [""],
+    },
+    Ordem: [{ Coluna: "Nome", Direcao: "true" }],
+  });
+
+  if (!rOp.ok) {
+    return `[1/4] Falha ao buscar operador: HTTP ${rOp.status}\n${rOp.text}`;
+  }
+  const opData = rOp.json || safeJsonParse(rOp.text, null);
+  if (!opData) {
+    return `[1/4] Resposta inválida ao buscar operador:\n${rOp.text}`;
+  }
+
+  const termo = String(args.nome_operador).toLowerCase().trim();
+  const operadores = (opData.root || []).filter((o) => {
+    const nomeCompleto = `${o.Nome || ""} ${o.Sobrenome || ""}`.toLowerCase();
+    return nomeCompleto.includes(termo);
+  });
+
+  if (operadores.length === 0) {
+    return `[1/4] Nenhum operador encontrado com nome "${args.nome_operador}".`;
+  }
+  if (operadores.length > 1) {
+    const lista = operadores
+      .map(
+        (o) =>
+          `  - Chave ${o.Chave}: ${o.Nome} ${o.Sobrenome || ""} (${
+            o.GrupoPrincipal || ""
+          })`
+      )
+      .join("\n");
+    return `[1/4] Ambiguidade — ${operadores.length} operadores encontrados:\n${lista}\nRefine o nome ou chame lancar_avaliacao direto com a Chave.`;
+  }
+  const operador = operadores[0];
+  const chaveOperador = operador.Chave;
+
+  // ---- 2) Resolver CodChamado → Chave ----
+  const rCham = await deskAPI("POST", "/ChamadosSuporte/lista", {
+    Pesquisa: args.cod_chamado,
+    Ativo: "Todos",
+    Colunas: { Chave: "on", CodChamado: "on", NomeStatus: "on" },
+    Ordem: [{ Coluna: "DataCriacao", Direcao: "false" }],
+    StartRow: 0,
+    EndRow: 2000,
+  });
+
+  if (!rCham.ok) {
+    return `[2/4] Falha ao buscar chamado: HTTP ${rCham.status}\n${rCham.text}`;
+  }
+  const chamData = rCham.json || safeJsonParse(rCham.text, null);
+  if (!chamData) {
+    return `[2/4] Resposta inválida ao buscar chamado:\n${String(
+      rCham.text
+    ).substring(0, 2000)}`;
+  }
+  const chamado = (chamData.root || []).find(
+    (c) => c.CodChamado === args.cod_chamado
+  );
+  if (!chamado) {
+    return `[2/4] Chamado ${args.cod_chamado} não encontrado (procurei nos primeiros 2000 com Ativo=Todos).`;
+  }
+  const chaveChamado = chamado.Chave;
+
+  // ---- 3) Buscar histórico da interação do operador ----
+  const rHist = await deskAPI("POST", "/ChamadoHistoricos/lista", {
+    Chave: String(chaveChamado),
+    CodChamado: "",
+    Solicitante: "N",
+    Colunas: {
+      Chave: "on",
+      Descricao: "on",
+      Status: "on",
+      Aberto: "on",
+      DataCriacao: "on",
+      HoraCriacao: "on",
+      DataAcao: "on",
+      Operador: "on",
+    },
+  });
+
+  if (!rHist.ok) {
+    return `[3/4] Falha ao listar históricos: HTTP ${rHist.status}\n${rHist.text}`;
+  }
+  const histData = rHist.json || safeJsonParse(rHist.text, null);
+  if (!histData) {
+    return `[3/4] Resposta inválida ao listar históricos:\n${String(
+      rHist.text
+    ).substring(0, 2000)}`;
+  }
+
+  const candidatos = (histData.root || []).filter((h) => {
+    const ops = h.Operador || [];
+    return ops.some((o) => String(o.id) === String(chaveOperador));
+  });
+  if (candidatos.length === 0) {
+    return `[3/4] Nenhuma interação de "${operador.Nome} ${
+      operador.Sobrenome || ""
+    }" (Chave ${chaveOperador}) no chamado ${args.cod_chamado} (Chave ${chaveChamado}).\nTotal de interações no chamado: ${
+      (histData.root || []).length
+    }`;
+  }
+  candidatos.sort((a, b) => {
+    const dA = `${a.DataCriacao || ""} ${a.HoraCriacao || ""}`;
+    const dB = `${b.DataCriacao || ""} ${b.HoraCriacao || ""}`;
+    return dB.localeCompare(dA);
+  });
+  const hist = candidatos[0];
+
+  // ---- 4) Lançar avaliação ----
+  const dados = {
+    TAvaliacaoTecnica: {
+      Chave: "",
+      ChaveOperador: "",
+      OperadorAvaliadoGrupo: "",
+      QuemAvaliouGrupo: "",
+      DataInteracao: "",
+      HoraInteracao: "",
+      DataAvaliacao: "",
+      HoraAvaliacao: "",
+      Operador: String(chaveOperador),
+      Chamado: String(chaveChamado),
+      DescricaoDaAcao: "",
+      NumeroAcao: "",
+      CodAvaliacao: String(args.cod_avaliacao),
+      Descricao: args.descricao || "",
+      Sugestao: args.sugestao || "",
+      LimparDS: "off",
+    },
+    THist: { Chave: String(hist.Chave) },
+  };
+  const formData = {
+    Dados: JSON.stringify(dados),
+    Menu: "AvaliacaoTecnica",
+    App: "EvaluationService",
+  };
+  const rAval = await deskWebForm("PUT", "/AvaliacaoTecnica", formData);
+
+  return [
+    `Resolução:`,
+    `  Operador  : ${operador.Nome} ${operador.Sobrenome || ""} (Chave ${chaveOperador})`,
+    `  Chamado   : ${args.cod_chamado} (Chave ${chaveChamado})`,
+    `  Histórico : Chave ${hist.Chave} — ${hist.DataCriacao || "?"} ${hist.HoraCriacao || "?"}`,
+    `  Nota      : ${args.cod_avaliacao}`,
+    ``,
+    `Resposta da API:`,
+    `HTTP ${rAval.status}`,
+    rAval.text,
+  ].join("\n");
+}
+
+/**
+ * =========================================================
+ * DEFINIÇÃO DAS TOOLS
  * =========================================================
  */
 const TOOLS = [
+  // ===== Chamados =====
   {
     name: "criar_chamado",
     description: "Cria um novo chamado no Desk Manager",
     inputSchema: {
       type: "object",
       properties: {
-        titulo: {
-          type: "string",
-          description: "Título do chamado",
-        },
-        descricao: {
-          type: "string",
-          description: "Descrição detalhada",
-        },
+        titulo: { type: "string", description: "Título do chamado" },
+        descricao: { type: "string", description: "Descrição detalhada" },
         prioridade_id: {
           type: "number",
           description: "1=Crítica 2=Alta 3=Média 4=Baixa",
@@ -475,7 +731,8 @@ const TOOLS = [
   },
   {
     name: "listar_chamados",
-    description: "Lista os chamados no Desk Manager",
+    description:
+      "Lista os chamados no Desk Manager. Suporta paginação server-side e filtros locais por Chave/CodChamado.",
     inputSchema: {
       type: "object",
       properties: {
@@ -491,7 +748,31 @@ const TOOLS = [
         ativo: {
           type: "string",
           description:
-            "Filtro de status: Todos, EmAberto, Favoritos, NaFila, MeusChamados, ou código do status (opcional). Padrão: EmAberto",
+            "Filtro de status: Todos, EmAberto, Favoritos, NaFila, MeusChamados, ou código do status. Padrão: EmAberto",
+        },
+        chave: {
+          type: "string",
+          description:
+            "Filtro LOCAL: buscar uma Chave numérica específica (ex: 92157)",
+        },
+        cod_chamado: {
+          type: "string",
+          description:
+            "Filtro LOCAL: buscar um CodChamado específico (ex: 0526-003997)",
+        },
+        inicio: {
+          type: "number",
+          description: "Paginação server-side: linha inicial (default 0)",
+        },
+        quantidade: {
+          type: "number",
+          description:
+            "Paginação server-side: registros por página (default 500, max 2000)",
+        },
+        limite: {
+          type: "number",
+          description:
+            "Truncar quantidade retornada ao cliente para evitar limite de 1MB (default 200)",
         },
       },
     },
@@ -501,17 +782,113 @@ const TOOLS = [
     description: "Busca um chamado pelo ID",
     inputSchema: {
       type: "object",
-      properties: {
-        id: {
-          type: "string",
-          description: "ID do chamado",
-        },
-      },
+      properties: { id: { type: "string", description: "ID do chamado" } },
       required: ["id"],
     },
   },
 
-  // ===== FAQ / Base =====
+  // ===== Operadores / Históricos =====
+  {
+    name: "listar_operadores",
+    description:
+      "Lista operadores cadastrados. Útil para resolver nome → Chave do operador (necessária para lançar avaliação).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pesquisa: {
+          type: "string",
+          description: "Texto para filtrar (busca em nome/sobrenome/email)",
+        },
+        ativo: {
+          type: "string",
+          description: "S (ativos) ou N (inativos). Default: S",
+        },
+        grupo: {
+          type: "string",
+          description: "Código do grupo principal (filtro opcional)",
+        },
+        limite: { type: "number", description: "Trunca resultado (default 200)" },
+      },
+    },
+  },
+  {
+    name: "listar_historicos",
+    description:
+      "Lista as interações/históricos de um chamado. Cada interação tem uma Chave que pode ser usada para lançar avaliação técnica.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chave: { type: "string", description: "Chave numérica do chamado" },
+        cod_chamado: {
+          type: "string",
+          description: "CodChamado (ex: 0526-003997) — alternativa à chave",
+        },
+        solicitante: {
+          type: "string",
+          description:
+            "S = oculta observações internas; N = exibe (default N)",
+        },
+      },
+    },
+  },
+
+  // ===== Avaliação Técnica =====
+  {
+    name: "avaliar_chamado",
+    description:
+      "Lança avaliação técnica em alto nível. Recebe CodChamado + nome do operador e resolve internamente as chaves do chamado, operador e histórico. Usa a interação mais recente do operador no chamado.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cod_chamado: {
+          type: "string",
+          description: "CodChamado (ex: 0526-003997)",
+        },
+        nome_operador: {
+          type: "string",
+          description: "Nome (ou trecho) do operador a ser avaliado",
+        },
+        cod_avaliacao: { type: "string", description: "Nota da avaliação" },
+        descricao: { type: "string", description: "Descrição da avaliação" },
+        sugestao: { type: "string", description: "Sugestão (opcional)" },
+      },
+      required: ["cod_chamado", "nome_operador", "cod_avaliacao", "descricao"],
+    },
+  },
+  {
+    name: "lancar_avaliacao",
+    description:
+      "Lança uma avaliação técnica para um chamado (baixo nível — exige chaves já resolvidas).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chamado: {
+          type: "string",
+          description: "Chave numérica do chamado a ser avaliado",
+        },
+        operador: { type: "string", description: "ID do operador avaliado" },
+        cod_avaliacao: {
+          type: "string",
+          description: "Código/nota da avaliação",
+        },
+        descricao: { type: "string", description: "Descrição da avaliação" },
+        sugestao: { type: "string", description: "Sugestão (opcional)" },
+        chave_historico: {
+          type: "string",
+          description: "Chave do histórico/interação avaliada",
+        },
+      },
+      required: [
+        "chamado",
+        "operador",
+        "cod_avaliacao",
+        "descricao",
+        "chave_historico",
+      ],
+    },
+  },
+
+  // ===== FAQ / Base de Conhecimento =====
   {
     name: "buscar_faq",
     description:
@@ -569,49 +946,44 @@ const TOOLS = [
 
 /**
  * =========================================================
- * REGRAS DAS TOOLS
+ * EXECUÇÃO DAS TOOLS
  * =========================================================
  */
 async function runTool(toolName, args = {}) {
-  // =========================
-  // CHAMADOS
-  // =========================
+  // ===== Chamados =====
   if (toolName === "criar_chamado") {
     if (!args.titulo || typeof args.titulo !== "string") {
       return toolText("Erro: o campo 'titulo' é obrigatório.", true);
     }
-
     if (!args.descricao || typeof args.descricao !== "string") {
       return toolText("Erro: o campo 'descricao' é obrigatório.", true);
     }
 
-    const response = await deskAPI("POST", "/Chamados", {
+    const res = await deskAPI("POST", "/Chamados", {
       titulo: args.titulo,
       descricao: args.descricao,
       prioridade_id: args.prioridade_id ?? 4,
       CodSolicitante: COD_SOLICITANTE,
     });
 
-    if (response.ok) {
-      const dados = response.json || {};
+    if (res.ok) {
+      const dados = res.json || {};
       const numero =
-        dados.id ||
-        dados.numero ||
-        dados.Ticket_ID ||
-        dados.codigo ||
-        "";
-
+        dados.id || dados.numero || dados.Ticket_ID || dados.codigo || "";
       return toolText(
         `Chamado criado com sucesso!${
           numero ? " Protocolo: " + numero : ""
-        }\nResposta: ${response.text}`
+        }\nResposta: ${res.text}`
       );
     }
-
-    return toolText(`Erro HTTP ${response.status}:\n${response.text}`, true);
+    return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
   }
 
   if (toolName === "listar_chamados") {
+    const inicio = Number(args.inicio) || 0;
+    const quantidade = Math.min(Number(args.quantidade) || 500, 2000);
+    const limite = Number(args.limite) || 200;
+
     const body = {
       Pesquisa: args.pesquisa || "",
       Ativo: args.ativo || "EmAberto",
@@ -630,48 +1002,208 @@ async function runTool(toolName, args = {}) {
         NomeGrupo: "on",
       },
       Ordem: [{ Coluna: "DataCriacao", Direcao: "false" }],
+      StartRow: inicio,
+      EndRow: inicio + quantidade,
     };
+    if (args.data_criacao) body.DataCriacao = args.data_criacao;
 
-    if (args.data_criacao) {
-      body.DataCriacao = args.data_criacao;
+    const res = await deskAPI("POST", "/ChamadosSuporte/lista", body);
+    if (!res.ok) {
+      return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
     }
 
-    const response = await deskAPI("POST", "/ChamadosSuporte/lista", body);
-
-    if (response.ok) {
-      return toolText(`HTTP ${response.status}:\n${response.text}`);
+    const data = res.json;
+    if (data && Array.isArray(data.root)) {
+      let filtrado = data.root;
+      if (args.chave) {
+        filtrado = filtrado.filter(
+          (c) => String(c.Chave) === String(args.chave)
+        );
+      }
+      if (args.cod_chamado) {
+        filtrado = filtrado.filter((c) => c.CodChamado === args.cod_chamado);
+      }
+      const totalFiltrado = filtrado.length;
+      const truncado = filtrado.slice(0, limite);
+      const resposta = {
+        root: truncado,
+        total_api: data.total || data.root.length,
+        total_filtrado: totalFiltrado,
+        retornados: truncado.length,
+        paginacao: { inicio, quantidade, fim: inicio + quantidade },
+      };
+      return toolText(`HTTP ${res.status}:\n${JSON.stringify(resposta)}`);
     }
-
-    return toolText(`Erro HTTP ${response.status}:\n${response.text}`, true);
+    return toolText(`HTTP ${res.status}:\n${res.text}`);
   }
 
   if (toolName === "buscar_chamado") {
     if (!args.id || typeof args.id !== "string") {
       return toolText("Erro: o campo 'id' é obrigatório.", true);
     }
-
-    const response = await deskAPI("GET", `/ChamadosSuporte/${args.id}`);
-
-    if (response.ok) {
-      return toolText(`HTTP ${response.status}:\n${response.text}`);
-    }
-
-    return toolText(`Erro HTTP ${response.status}:\n${response.text}`, true);
+    const res = await deskAPI("GET", `/ChamadosSuporte/${args.id}`);
+    if (res.ok) return toolText(`HTTP ${res.status}:\n${res.text}`);
+    return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
   }
 
-  // =========================
-  // FAQ / BASE
-  // =========================
+  // ===== Operadores / Históricos =====
+  if (toolName === "listar_operadores") {
+    const limite = Number(args.limite) || 200;
+    const body = {
+      Colunas: {
+        Chave: "on",
+        Nome: "on",
+        Sobrenome: "on",
+        Email: "on",
+        OnOff: "on",
+        GrupoPrincipal: "on",
+        EmailGrupo: "on",
+        CodGrupo: "on",
+      },
+      Pesquisa: args.pesquisa || "",
+      Ativo: args.ativo || "S",
+      Filtro: {
+        Ramal: [""],
+        GrupoPrincipal: [args.grupo || ""],
+        Perfil: [""],
+        Online: [""],
+        LicencaDMS: [""],
+        LicencaCHAT: [""],
+        LicencaRCS: [""],
+        LicencaFornecedor: [""],
+      },
+      Ordem: [{ Coluna: "Nome", Direcao: "true" }],
+    };
+
+    const res = await deskAPI("POST", "/Operadores/lista", body);
+    if (!res.ok) {
+      return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
+    }
+
+    const data = res.json;
+    if (data && Array.isArray(data.root)) {
+      const truncado = data.root.slice(0, limite);
+      const resposta = {
+        root: truncado,
+        total_api: data.total || data.root.length,
+        retornados: truncado.length,
+      };
+      return toolText(`HTTP ${res.status}:\n${JSON.stringify(resposta)}`);
+    }
+    return toolText(`HTTP ${res.status}:\n${res.text}`);
+  }
+
+  if (toolName === "listar_historicos") {
+    const body = {
+      Chave: args.chave || "",
+      CodChamado: args.cod_chamado || "",
+      Solicitante: args.solicitante || "N",
+      Colunas: {
+        Chave: "on",
+        Descricao: "on",
+        ObservacaoInterna: "on",
+        Status: "on",
+        Aberto: "on",
+        DataCriacao: "on",
+        HoraCriacao: "on",
+        DataAcao: "on",
+        Solicitante: "on",
+        Operador: "on",
+        NomeFormaAtendimento: "on",
+        CodCausa: "on",
+        NomeCausa: "on",
+        HoraAcaoInicio: "on",
+        HoraAcaoFim: "on",
+        TotalHoras: "on",
+      },
+    };
+    const res = await deskAPI("POST", "/ChamadoHistoricos/lista", body);
+    if (res.ok) return toolText(`HTTP ${res.status}:\n${res.text}`);
+    return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
+  }
+
+  // ===== Avaliação Técnica =====
+  if (toolName === "avaliar_chamado") {
+    if (!args.cod_chamado || typeof args.cod_chamado !== "string") {
+      return toolText("Erro: o campo 'cod_chamado' é obrigatório.", true);
+    }
+    if (!args.nome_operador || typeof args.nome_operador !== "string") {
+      return toolText("Erro: o campo 'nome_operador' é obrigatório.", true);
+    }
+    if (args.cod_avaliacao === undefined || args.cod_avaliacao === null) {
+      return toolText("Erro: o campo 'cod_avaliacao' é obrigatório.", true);
+    }
+    if (!args.descricao || typeof args.descricao !== "string") {
+      return toolText("Erro: o campo 'descricao' é obrigatório.", true);
+    }
+
+    const texto = await orchestrateAvaliacao(args);
+    // Marca como erro se a orquestração não chegou ao passo final.
+    const isError =
+      texto.startsWith("[1/4]") ||
+      texto.startsWith("[2/4]") ||
+      texto.startsWith("[3/4]");
+    return toolText(texto, isError);
+  }
+
+  if (toolName === "lancar_avaliacao") {
+    const obrigatorios = [
+      "chamado",
+      "operador",
+      "cod_avaliacao",
+      "descricao",
+      "chave_historico",
+    ];
+    const faltando = obrigatorios.filter(
+      (k) => args[k] === undefined || args[k] === null || args[k] === ""
+    );
+    if (faltando.length) {
+      return toolText(
+        `Erro: campos obrigatórios ausentes: ${faltando.join(", ")}.`,
+        true
+      );
+    }
+
+    const dados = {
+      TAvaliacaoTecnica: {
+        Chave: "",
+        ChaveOperador: "",
+        OperadorAvaliadoGrupo: "",
+        QuemAvaliouGrupo: "",
+        DataInteracao: "",
+        HoraInteracao: "",
+        DataAvaliacao: "",
+        HoraAvaliacao: "",
+        Operador: String(args.operador),
+        Chamado: String(args.chamado),
+        DescricaoDaAcao: "",
+        NumeroAcao: "",
+        CodAvaliacao: String(args.cod_avaliacao),
+        Descricao: args.descricao || "",
+        Sugestao: args.sugestao || "",
+        LimparDS: "off",
+      },
+      THist: { Chave: String(args.chave_historico) },
+    };
+    const formData = {
+      Dados: JSON.stringify(dados),
+      Menu: "AvaliacaoTecnica",
+      App: "EvaluationService",
+    };
+    const res = await deskWebForm("PUT", "/AvaliacaoTecnica", formData);
+    if (res.ok) return toolText(`HTTP ${res.status}:\n${res.text}`);
+    return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
+  }
+
+  // ===== FAQ / Base =====
   if (toolName === "buscar_faq") {
     if (!args.consulta || typeof args.consulta !== "string") {
       return toolText("Erro: o campo 'consulta' é obrigatório.", true);
     }
-
     const resultados = await searchKnowledge(args.consulta, {
       limit: Number(args.limite || 5),
       onlyFaq: true,
     });
-
     return toolText(JSON.stringify({ resultados }, null, 2));
   }
 
@@ -679,12 +1211,10 @@ async function runTool(toolName, args = {}) {
     if (!args.consulta || typeof args.consulta !== "string") {
       return toolText("Erro: o campo 'consulta' é obrigatório.", true);
     }
-
     const resultados = await searchKnowledge(args.consulta, {
       limit: Number(args.limite || 5),
       onlyArticles: true,
     });
-
     return toolText(JSON.stringify({ resultados }, null, 2));
   }
 
@@ -692,16 +1222,13 @@ async function runTool(toolName, args = {}) {
     if (!args.id || typeof args.id !== "string") {
       return toolText("Erro: o campo 'id' é obrigatório.", true);
     }
-
     const artigo = await getKnowledgeById(args.id);
-
     if (!artigo) {
       return toolText(
         `Nenhum artigo/FAQ encontrado para o id '${args.id}'.`,
         true
       );
     }
-
     return toolText(JSON.stringify(artigo, null, 2));
   }
 
@@ -720,8 +1247,10 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    service: "desk-manager-remote-mcp",
+    service: SERVER_INFO.name,
+    version: SERVER_INFO.version,
     transport: "streamable-http",
+    tools: TOOLS.map((t) => t.name),
   });
 });
 
@@ -732,8 +1261,8 @@ app.get("/health", (req, res) => {
  */
 app.get("/mcp", authMiddleware, originMiddleware, (req, res) => {
   res.json({
-    name: "desk-manager-remote-mcp",
-    version: "1.1.0",
+    name: SERVER_INFO.name,
+    version: SERVER_INFO.version,
     endpoint: "/mcp",
     transport: "streamable-http",
     methods: [
@@ -762,12 +1291,7 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
       return res
         .status(400)
         .json(
-          jsonRpcError(
-            id,
-            -32600,
-            "Invalid Request",
-            "jsonrpc deve ser '2.0'."
-          )
+          jsonRpcError(id, -32600, "Invalid Request", "jsonrpc deve ser '2.0'.")
         );
     }
 
@@ -789,14 +1313,9 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
     if (method === "initialize") {
       return res.json(
         jsonRpcSuccess(id, {
-          protocolVersion: "2025-03-26",
-          capabilities: {
-            tools: {},
-          },
-          serverInfo: {
-            name: "desk-manager-remote-mcp",
-            version: "1.1.0",
-          },
+          protocolVersion: params?.protocolVersion || PROTOCOL_VERSION,
+          capabilities: { tools: {} },
+          serverInfo: SERVER_INFO,
         })
       );
     }
@@ -806,11 +1325,7 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
     }
 
     if (method === "tools/list") {
-      return res.json(
-        jsonRpcSuccess(id, {
-          tools: TOOLS,
-        })
-      );
+      return res.json(jsonRpcSuccess(id, { tools: TOOLS }));
     }
 
     if (method === "tools/call") {
@@ -830,8 +1345,17 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
           );
       }
 
-      const result = await runTool(toolName, toolArgs);
-      return res.json(jsonRpcSuccess(id, result));
+      try {
+        const result = await runTool(toolName, toolArgs);
+        return res.json(jsonRpcSuccess(id, result));
+      } catch (toolErr) {
+        // Erros de execução de tool voltam como result.isError (padrão MCP),
+        // não como erro de protocolo, para o modelo conseguir reagir.
+        console.error("[MCP][TOOL ERROR]", toolName, toolErr);
+        return res.json(
+          jsonRpcSuccess(id, toolText(`Erro ao executar '${toolName}': ${toolErr.message}`, true))
+        );
+      }
     }
 
     return res
@@ -839,7 +1363,6 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
       .json(jsonRpcError(id, -32601, "Method not found", method));
   } catch (err) {
     console.error("[MCP][ERROR]", err);
-
     return res
       .status(500)
       .json(jsonRpcError(id, -32603, "Internal error", err.message));
@@ -853,4 +1376,5 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
  */
 app.listen(PORT, () => {
   log(`Servidor remoto rodando na porta ${PORT}`);
+  log(`Tools: ${TOOLS.map((t) => t.name).join(", ")}`);
 });
