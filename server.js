@@ -1,92 +1,58 @@
-// =====================================================================
-// server.js — Desk Manager Remote MCP (versão unificada)
-// ---------------------------------------------------------------------
-// Junta o melhor dos dois mundos:
-//   • Transporte HTTP remoto (streamable-http) + segurança + base de
-//     conhecimento/FAQ  → do servidor remoto atual
-//   • Ferramentas completas (operadores, históricos, avaliação técnica),
-//     paginação server-side, filtros locais e timeout de rede → do MCP
-//     stdio antigo
-//
-// IMPORTANTE: nenhuma credencial fica no código. Tudo vem de variáveis
-// de ambiente. As chaves que estavam hardcoded no MCP antigo devem ser
-// CONSIDERADAS COMPROMETIDAS e rotacionadas no Desk Manager.
-// =====================================================================
-
 import express from "express";
 import http from "node:http";
 import https from "node:https";
 import { URL } from "node:url";
 
-/**
- * =========================================================
- * CONFIGURAÇÃO (variáveis de ambiente)
- * =========================================================
- */
 const PORT = Number(process.env.PORT || 3000);
 
-// --- Credenciais Desk Manager (OBRIGATÓRIAS) ---
+
 const OP_KEY = process.env.OP_KEY || "";
 const ENV_KEY = process.env.ENV_KEY || "";
 const COD_SOLICITANTE = Number(process.env.COD_SOLICITANTE || 289);
 
-// --- Hosts da API ---
+
 const RAW_DESK_API_HOST = process.env.DESK_API_HOST || "https://api.desk.ms";
 const DESK_API_BASE = normalizeBaseUrl(RAW_DESK_API_HOST);
 
-// Host do formulário web usado para lançar Avaliação Técnica
+
 const RAW_DESK_WEB_HOST = process.env.DESK_WEB_HOST || "https://vocedm.desk.ms";
 const DESK_WEB_BASE = normalizeBaseUrl(RAW_DESK_WEB_HOST);
 
-// --- Rede ---
+
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000); // 30s
-// O Desk Manager historicamente exige rejectUnauthorized:false (cadeia de
-// certificado incompleta). Mantemos esse comportamento por padrão, mas é
-// configurável: defina DESK_TLS_INSECURE=false quando o cert estiver ok.
+
 const DESK_TLS_INSECURE =
   String(process.env.DESK_TLS_INSECURE ?? "true").toLowerCase() !== "false";
 const FAQ_TLS_INSECURE =
   String(process.env.FAQ_TLS_INSECURE ?? "false").toLowerCase() === "true";
 
-// --- Segurança do MCP remoto ---
+
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN || "";
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// --- Base de Conhecimento / FAQ ---
-// Fonte da base: "desk_api" (Base de Conhecimento do Desk Manager — recomendado)
-//              | "remote_json" (catálogo JSON externo) | "inline_json".
+
 const FAQ_SOURCE_MODE = process.env.FAQ_SOURCE_MODE || "desk_api";
 const FAQ_JSON_URL = process.env.FAQ_JSON_URL || "";
 const FAQ_DATA_JSON = process.env.FAQ_DATA_JSON || "";
-const KB_REFRESH_MS = Number(process.env.KB_REFRESH_MS || 300000); // 5 min
-const KB_STATUS = process.env.KB_STATUS || "S"; // S:ativos, N:inativos, vazio:todos
-const KB_MAX = Number(process.env.KB_MAX || 5000); // teto de itens carregados em memória
+const KB_REFRESH_MS = Number(process.env.KB_REFRESH_MS || 300000); 
+const KB_STATUS = process.env.KB_STATUS || "S"; 
+const KB_MAX = Number(process.env.KB_MAX || 5000); 
 
-// --- Anthropic (rota /chat — proxy do widget → Claude) ---
+
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 const ANTHROPIC_MAX_TOKENS = Number(process.env.ANTHROPIC_MAX_TOKENS || 4096);
 const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_MCP_BETA = "mcp-client-2025-04-04";
-const CHAT_TIMEOUT_MS = Number(process.env.CHAT_TIMEOUT_MS || 120000); // tool-calls demoram mais
+const CHAT_TIMEOUT_MS = Number(process.env.CHAT_TIMEOUT_MS || 120000); 
 
-// URL pública DESTE serviço — a Anthropic chama o /mcp de volta (server-to-server).
+
 const PUBLIC_MCP_URL =
   process.env.PUBLIC_MCP_URL || "https://mcp-ia.onrender.com/mcp";
 
-// =========================================================
-// PERSONA E REGRAS DA SIA (system prompt)
-// ---------------------------------------------------------
-// Edite SIA_RULES para ajustar o comportamento. Você também pode:
-//   • Sobrescrever 100% do prompt via env SIA_SYSTEM_PROMPT
-//   • Apenas ANEXAR regras extras via env SIA_EXTRA_RULES
-// O modelo é instruído a seguir estas regras à risca e a não se desviar.
-// (Lembrete: system prompt orienta o comportamento de forma forte, mas não
-//  é um cadeado absoluto — combine com revisão humana em fluxos críticos.)
-// =========================================================
 const SIA_RULES = [
   "Identidade: você é a SIA (Suporte de Inteligência Artificial), assistente virtual do Desk Manager. Ao se apresentar ou ser citada, use o nome SIA.",
   "Tom: seja sempre amigável, educada, acolhedora e profissional. Trate o usuário com respeito e empatia, inclusive quando ele estiver irritado.",
@@ -100,7 +66,6 @@ const SIA_RULES = [
   "Ambiguidade: se a solicitação não estiver clara, faça no máximo UMA pergunta objetiva para esclarecer antes de prosseguir.",
 ];
 
-// Regras adicionais específicas da organização (texto livre, opcional).
 const SIA_EXTRA_RULES = process.env.SIA_EXTRA_RULES || "";
 
 const SIA_SYSTEM_PROMPT =
@@ -117,7 +82,7 @@ const SIA_SYSTEM_PROMPT =
     .filter(Boolean)
     .join("\n");
 
-// --- Protocolo MCP ---
+
 const PROTOCOL_VERSION = "2025-03-26";
 const SERVER_INFO = { name: "desk-manager-remote-mcp", version: "2.0.0" };
 
@@ -126,17 +91,13 @@ app.use(express.json({ limit: "2mb" }));
 
 let cachedToken = null;
 
-// cache da base de conhecimento
+
 let knowledgeCache = {
   loadedAt: 0,
   items: [],
 };
 
-/**
- * =========================================================
- * HELPERS GERAIS
- * =========================================================
- */
+
 function normalizeBaseUrl(value) {
   if (!value) return "https://api.desk.ms";
   if (!/^https?:\/\//i.test(value)) {
@@ -208,11 +169,6 @@ function formEncode(params) {
     .join("&");
 }
 
-/**
- * Cliente HTTP unificado (nativo http/https) com timeout, controle de TLS
- * e suporte a body JSON ou form-urlencoded.
- * Retorna { ok, status, text, json }.
- */
 function requestRaw(
   method,
   urlStr,
@@ -286,11 +242,6 @@ function requestRaw(
   });
 }
 
-/**
- * =========================================================
- * HELPERS DE BUSCA (FAQ / Base)
- * =========================================================
- */
 function normalizeText(value = "") {
   return String(value)
     .normalize("NFD")
@@ -355,11 +306,7 @@ function scoreItem(item, query) {
   return score;
 }
 
-/**
- * =========================================================
- * SEGURANÇA DO MCP REMOTO
- * =========================================================
- */
+
 function authMiddleware(req, res, next) {
   if (!MCP_BEARER_TOKEN) return next();
 
@@ -388,8 +335,7 @@ function originMiddleware(req, res, next) {
   next();
 }
 
-// CORS específico da rota /chat (chamada pelo browser/widget).
-// Reaproveita ALLOWED_ORIGINS; vazio = libera qualquer origin ("*").
+
 function chatCors(req, res, next) {
   const origin = req.headers.origin;
   const allowed = !ALLOWED_ORIGINS.length
@@ -409,11 +355,7 @@ function chatCors(req, res, next) {
   next();
 }
 
-/**
- * =========================================================
- * DESK MANAGER — AUTH / API
- * =========================================================
- */
+
 async function getDeskToken() {
   ensureEnv();
   if (cachedToken) return cachedToken;
@@ -441,7 +383,7 @@ async function getDeskToken() {
   } else if (typeof parsed === "string") {
     token = parsed;
   } else {
-    // token devolvido como string crua (sem aspas JSON)
+  
     token = res.text ? res.text.trim().replace(/^"|"$/g, "") : null;
   }
 
@@ -453,7 +395,6 @@ async function getDeskToken() {
   return cachedToken;
 }
 
-// Chamadas JSON à API principal (api.desk.ms), com retry de token.
 async function deskAPI(method, path, body = null) {
   const token = await getDeskToken();
 
@@ -476,7 +417,7 @@ async function deskAPI(method, path, body = null) {
   return res;
 }
 
-// Chamadas form-urlencoded ao host web (vocedm.desk.ms) — Avaliação Técnica.
+
 async function deskWebForm(method, path, formData) {
   const token = await getDeskToken();
 
@@ -499,24 +440,6 @@ async function deskWebForm(method, path, formData) {
   return res;
 }
 
-/**
- * =========================================================
- * BASE DE CONHECIMENTO / FAQ
- * =========================================================
- * Fonte padrão: "desk_api" → POST /BaseConhecimento/lista (Desk Manager).
- * Cada item retornado pela API tem o formato:
- *   { Chave, Titulo, Categoria:[{id,text}], Aprovador, LinkExterno,
- *     PalavrasChave (string separada por vírgula), Comentarios }
- *
- * Observação: a listagem NÃO traz o corpo do artigo. Os campos fortes
- * para busca são Titulo, PalavrasChave e Categoria. Quando houver corpo
- * completo, normalmente estará em LinkExterno.
- *
- * Fontes alternativas ("remote_json" / "inline_json") esperam o catálogo:
- *   { id, titulo, resumo, conteudo, tipo, palavras_chave:[], url, fonte, ativo }
- */
-
-// Converte um item cru da Base do Desk para o formato interno de busca.
 function mapDeskKbItem(raw) {
   if (!raw || typeof raw !== "object") return null;
 
@@ -548,7 +471,6 @@ function mapDeskKbItem(raw) {
     comentarios: String(raw.Comentarios || ""),
     link_externo: String(raw.LinkExterno || ""),
     aprovador: raw.Aprovador != null ? String(raw.Aprovador) : "",
-    // campos de compatibilidade com o motor de busca:
     resumo: "",
     conteudo: String(raw.Comentarios || ""),
     tipo: "Artigo",
@@ -568,7 +490,6 @@ async function loadKnowledgeBase() {
     return knowledgeCache.items;
   }
 
-  // ---- Fonte principal: Base de Conhecimento do Desk Manager ----
   if (FAQ_SOURCE_MODE === "desk_api") {
     const res = await deskAPI("POST", "/BaseConhecimento/lista", {
       Pesquisa: "",
@@ -598,7 +519,6 @@ async function loadKnowledgeBase() {
     return items;
   }
 
-  // ---- Fontes alternativas: JSON externo ou inline ----
   let items = [];
 
   if (FAQ_SOURCE_MODE === "inline_json") {
@@ -679,7 +599,6 @@ async function getKnowledgeById(id) {
   return base.find((item) => item.id === id) || null;
 }
 
-// Recorta um item da base para um retorno enxuto e útil ao modelo.
 function formatKbResult(item) {
   return {
     id: item.id,
@@ -692,15 +611,9 @@ function formatKbResult(item) {
   };
 }
 
-/**
- * =========================================================
- * ORQUESTRAÇÃO — AVALIAÇÃO TÉCNICA (alto nível)
- * =========================================================
- * Resolve nome do operador → Chave, CodChamado → Chave, encontra a
- * interação mais recente do operador e lança a avaliação técnica.
- */
+
 async function orchestrateAvaliacao(args) {
-  // ---- 1) Resolver nome do operador → Chave ----
+
   const rOp = await deskAPI("POST", "/Operadores/lista", {
     Colunas: {
       Chave: "on",
@@ -758,7 +671,6 @@ async function orchestrateAvaliacao(args) {
   const operador = operadores[0];
   const chaveOperador = operador.Chave;
 
-  // ---- 2) Resolver CodChamado → Chave ----
   const rCham = await deskAPI("POST", "/ChamadosSuporte/lista", {
     Pesquisa: args.cod_chamado,
     Ativo: "Todos",
@@ -785,7 +697,6 @@ async function orchestrateAvaliacao(args) {
   }
   const chaveChamado = chamado.Chave;
 
-  // ---- 3) Buscar histórico da interação do operador ----
   const rHist = await deskAPI("POST", "/ChamadoHistoricos/lista", {
     Chave: String(chaveChamado),
     CodChamado: "",
@@ -830,7 +741,6 @@ async function orchestrateAvaliacao(args) {
   });
   const hist = candidatos[0];
 
-  // ---- 4) Lançar avaliação ----
   const dados = {
     TAvaliacaoTecnica: {
       Chave: "",
@@ -872,13 +782,8 @@ async function orchestrateAvaliacao(args) {
   ].join("\n");
 }
 
-/**
- * =========================================================
- * DEFINIÇÃO DAS TOOLS
- * =========================================================
- */
 const TOOLS = [
-  // ===== Chamados =====
+
   {
     name: "criar_chamado",
     description: "Cria um novo chamado no Desk Manager",
@@ -953,7 +858,6 @@ const TOOLS = [
     },
   },
 
-  // ===== Operadores / Históricos =====
   {
     name: "listar_operadores",
     description:
@@ -998,7 +902,7 @@ const TOOLS = [
     },
   },
 
-  // ===== Avaliação Técnica =====
+
   {
     name: "avaliar_chamado",
     description:
@@ -1054,7 +958,7 @@ const TOOLS = [
     },
   },
 
-  // ===== FAQ / Base de Conhecimento =====
+  
   {
     name: "buscar_faq",
     description:
@@ -1110,13 +1014,9 @@ const TOOLS = [
   },
 ];
 
-/**
- * =========================================================
- * EXECUÇÃO DAS TOOLS
- * =========================================================
- */
+
 async function runTool(toolName, args = {}) {
-  // ===== Chamados =====
+ 
   if (toolName === "criar_chamado") {
     if (!args.titulo || typeof args.titulo !== "string") {
       return toolText("Erro: o campo 'titulo' é obrigatório.", true);
@@ -1212,7 +1112,7 @@ async function runTool(toolName, args = {}) {
     return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
   }
 
-  // ===== Operadores / Históricos =====
+  
   if (toolName === "listar_operadores") {
     const limite = Number(args.limite) || 200;
     const body = {
@@ -1288,7 +1188,6 @@ async function runTool(toolName, args = {}) {
     return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
   }
 
-  // ===== Avaliação Técnica =====
   if (toolName === "avaliar_chamado") {
     if (!args.cod_chamado || typeof args.cod_chamado !== "string") {
       return toolText("Erro: o campo 'cod_chamado' é obrigatório.", true);
@@ -1304,7 +1203,7 @@ async function runTool(toolName, args = {}) {
     }
 
     const texto = await orchestrateAvaliacao(args);
-    // Marca como erro se a orquestração não chegou ao passo final.
+
     const isError =
       texto.startsWith("[1/4]") ||
       texto.startsWith("[2/4]") ||
@@ -1361,7 +1260,7 @@ async function runTool(toolName, args = {}) {
     return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
   }
 
-  // ===== Base de Conhecimento / FAQ =====
+
   if (toolName === "buscar_faq") {
     if (!args.consulta || typeof args.consulta !== "string") {
       return toolText("Erro: o campo 'consulta' é obrigatório.", true);
@@ -1418,11 +1317,6 @@ async function runTool(toolName, args = {}) {
   return toolText(`Ferramenta desconhecida: ${toolName}`, true);
 }
 
-/**
- * =========================================================
- * HEALTH / INFO
- * =========================================================
- */
 app.get("/", (req, res) => {
   res.send("MCP Server rodando ✅");
 });
@@ -1437,16 +1331,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-/**
- * =========================================================
- * /chat — PROXY DO WIDGET → CLAUDE (Anthropic API)
- * =========================================================
- * O browser NÃO pode segurar a API key da Anthropic. Esta rota:
- *   1. recebe { messages } do widget;
- *   2. injeta a x-api-key (env) + system prompt da SIA;
- *   3. configura mcp_servers apontando para o /mcp DESTE serviço.
- * A Anthropic chama o /mcp de volta sozinha (server-to-server).
- */
+
 app.options("/chat", chatCors);
 app.post("/chat", chatCors, async (req, res) => {
   try {
@@ -1461,7 +1346,7 @@ app.post("/chat", chatCors, async (req, res) => {
       return res.status(400).json({ error: "messages é obrigatório." });
     }
 
-    // MCP apontando para o próprio serviço; envia o Bearer se houver.
+    
     const mcpServer = {
       type: "url",
       url: PUBLIC_MCP_URL,
@@ -1506,11 +1391,7 @@ app.post("/chat", chatCors, async (req, res) => {
   }
 });
 
-/**
- * =========================================================
- * MCP ENDPOINT
- * =========================================================
- */
+
 app.get("/mcp", authMiddleware, originMiddleware, (req, res) => {
   res.json({
     name: SERVER_INFO.name,
@@ -1601,8 +1482,6 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
         const result = await runTool(toolName, toolArgs);
         return res.json(jsonRpcSuccess(id, result));
       } catch (toolErr) {
-        // Erros de execução de tool voltam como result.isError (padrão MCP),
-        // não como erro de protocolo, para o modelo conseguir reagir.
         console.error("[MCP][TOOL ERROR]", toolName, toolErr);
         return res.json(
           jsonRpcSuccess(id, toolText(`Erro ao executar '${toolName}': ${toolErr.message}`, true))
@@ -1621,11 +1500,6 @@ app.post("/mcp", authMiddleware, originMiddleware, async (req, res) => {
   }
 });
 
-/**
- * =========================================================
- * START
- * =========================================================
- */
 app.listen(PORT, () => {
   log(`Servidor remoto rodando na porta ${PORT}`);
   log(`Tools: ${TOOLS.map((t) => t.name).join(", ")}`);
