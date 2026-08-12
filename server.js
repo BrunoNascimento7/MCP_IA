@@ -845,6 +845,17 @@ const TOOLS = [
           description:
             "Truncar quantidade retornada ao cliente para evitar limite de 1MB (default 200)",
         },
+        todas_colunas: {
+          type: "boolean",
+          description:
+            "Se true, não envia o parâmetro Colunas para a API do Desk Manager, que nesse caso retorna todos os campos disponíveis (inclusive SLA e campos extras). Se false ou ausente, usa o conjunto de colunas padrão já expandido.",
+        },
+        colunas_extra: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Lista de nomes de colunas adicionais para incluir no conjunto padrão (ex: '_6313' para campo extra). Ignorado se todas_colunas for true.",
+        },
       },
     },
   },
@@ -897,6 +908,29 @@ const TOOLS = [
           type: "string",
           description:
             "S = oculta observações internas; N = exibe (default N)",
+        },
+      },
+    },
+  },
+
+  {
+    name: "listar_causas",
+    description:
+      "Lista as causas cadastradas no Desk Manager, usadas para categorizar o motivo de um chamado.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pesquisa: {
+          type: "string",
+          description: "Texto para filtrar causas pelo nome (opcional)",
+        },
+        ativo: {
+          type: "string",
+          description: "1 = ativas, 0 = inativas. Padrão: 1",
+        },
+        limite: {
+          type: "number",
+          description: "Trunca resultado (default 200)",
         },
       },
     },
@@ -1053,24 +1087,60 @@ async function runTool(toolName, args = {}) {
     const body = {
       Pesquisa: args.pesquisa || "",
       Ativo: args.ativo || "EmAberto",
-      Colunas: {
+      Ordem: [{ Coluna: "DataCriacao", Direcao: "false" }],
+      StartRow: inicio,
+      EndRow: inicio + quantidade,
+    };
+
+    if (args.todas_colunas) {
+      // Não envia Colunas de propósito: a API do Desk Manager retorna todos
+      // os campos disponíveis quando esse parâmetro não é informado.
+    } else {
+      body.Colunas = {
         Chave: "on",
         CodChamado: "on",
         NomePrioridade: "on",
         DataCriacao: "on",
         HoraCriacao: "on",
+        DataFinalizacao: "on",
+        HoraFinalizacao: "on",
+        DataAlteracao: "on",
+        HoraAlteracao: "on",
         NomeStatus: "on",
         Assunto: "on",
+        AssuntoEmailChamado: "on",
+        Descricao: "on",
+        ChaveUsuario: "on",
+        NomeUsuario: "on",
+        SobrenomeUsuario: "on",
         NomeCompletoSolicitante: "on",
+        SolicitanteEmail: "on",
+        CodOperador: "on",
         NomeOperador: "on",
         SobrenomeOperador: "on",
+        TotalAcoes: "on",
+        TotalAnexos: "on",
+        Sla: "on",
         CodGrupo: "on",
         NomeGrupo: "on",
-      },
-      Ordem: [{ Coluna: "DataCriacao", Direcao: "false" }],
-      StartRow: inicio,
-      EndRow: inicio + quantidade,
-    };
+        CodSolicitacao: "on",
+        CodSubCategoria: "on",
+        CodTipoOcorrencia: "on",
+        CodCategoriaTipo: "on",
+        CodPrioridadeAtual: "on",
+        CodStatusAtual: "on",
+        TokenPS: "on",
+      };
+
+      if (Array.isArray(args.colunas_extra)) {
+        for (const campo of args.colunas_extra) {
+          if (typeof campo === "string" && campo.trim()) {
+            body.Colunas[campo.trim()] = "on";
+          }
+        }
+      }
+    }
+
     if (args.data_criacao) body.DataCriacao = args.data_criacao;
 
     const res = await deskAPI("POST", "/ChamadosSuporte/lista", body);
@@ -1186,6 +1256,32 @@ async function runTool(toolName, args = {}) {
     const res = await deskAPI("POST", "/ChamadoHistoricos/lista", body);
     if (res.ok) return toolText(`HTTP ${res.status}:\n${res.text}`);
     return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
+  }
+
+  if (toolName === "listar_causas") {
+    const limite = Number(args.limite) || 200;
+    const body = {
+      Pesquisa: args.pesquisa || "",
+      Ativo: args.ativo || "1",
+      Ordem: [{ Coluna: "Nome", Direcao: "true" }],
+    };
+
+    const res = await deskAPI("POST", "/Causas/lista", body);
+    if (!res.ok) {
+      return toolText(`Erro HTTP ${res.status}:\n${res.text}`, true);
+    }
+
+    const data = res.json;
+    if (data && Array.isArray(data.root)) {
+      const truncado = data.root.slice(0, limite);
+      const resposta = {
+        root: truncado,
+        total_api: data.total || data.root.length,
+        retornados: truncado.length,
+      };
+      return toolText(`HTTP ${res.status}:\n${JSON.stringify(resposta)}`);
+    }
+    return toolText(`HTTP ${res.status}:\n${res.text}`);
   }
 
   if (toolName === "avaliar_chamado") {
